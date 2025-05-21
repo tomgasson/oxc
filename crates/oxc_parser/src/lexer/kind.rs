@@ -424,6 +424,34 @@ impl Kind {
         Self::match_keyword_impl(s)
     }
 
+    // 
+    pub fn fixed_len(self) -> Option<usize> {
+        match self {
+            Kind::Abstract => Some(8),
+            Kind::Accessor => Some(8),
+            Kind::Async => Some(5),
+            Kind::Await => Some(5),
+            Kind::Break => Some(5),
+            Kind::Case => Some(4),
+            Kind::LAngle => Some(1),
+            Kind::RAngle => Some(1),
+            Kind::LBrack => Some(1),
+            Kind::RBrack => Some(1),
+            Kind::LCurly => Some(1),
+            Kind::RCurly => Some(1),
+            Kind::LParen => Some(1),
+            Kind::RParen => Some(1),
+            Kind::Semicolon => Some(1),
+            Kind::Comma => Some(1),
+            Kind::Dot => Some(1),
+            Kind::Dot3 => Some(3),
+            Kind::Eq => Some(1),
+            Kind::Eq2 => Some(2),
+            Kind::Eq3 => Some(3),
+            _ => None
+        }
+    }
+
     fn match_keyword_impl(s: &str) -> Self {
         match s {
             "as" => As,

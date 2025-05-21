@@ -90,7 +90,12 @@ impl Token {
 
     #[inline]
     pub fn end(&self) -> u32 {
-        ((self.0 >> END_SHIFT) & END_MASK) as u32
+        let e = ((self.0 >> END_SHIFT) & END_MASK) as u32;
+        // Assertion to check that `start` and `end` are valid, and that the len matches the expected len of fixed-size kinds
+        if let Some(len) = self.kind().fixed_len() {
+            debug_assert!(e - self.start() == len as u32, "Token end ({e}) - start ({}) != len ({}) kind: {:?}", self.start(), len, self.kind());
+        }
+        e
     }
 
     #[inline]
