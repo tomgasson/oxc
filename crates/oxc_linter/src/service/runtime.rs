@@ -770,13 +770,23 @@ impl Runtime {
                 }
             }
 
-            // From a non-worker these land on rayon's FIFO injector, behind parses already queued.
-            // Running them first was measured on VS Code and AFFiNE (4 cores) and did not lower peak RSS.
-            for entry in take(&mut group.modules_to_lint) {
-                let on_entry = on_module_to_lint.clone();
-                scope.spawn(move |_| {
-                    on_entry(me, entry);
-                });
+            let entries = take(&mut group.modules_to_lint);
+            let lint_group = |lint_scope: &Scope<'a>| {
+                for entry in entries {
+                    let on_entry = on_module_to_lint.clone();
+                    lint_scope.spawn(move |_| {
+                        on_entry(me, entry);
+                    });
+                }
+            };
+            if is_worker_thread {
+                // Newly queued parses can overtake these lints on a worker's LIFO queue.
+                // Finish this group's lints before admitting more groups in that case.
+                rayon::scope(lint_group);
+            } else {
+                // From a non-worker these land on rayon's FIFO injector, behind parses already queued.
+                // Running them first was measured on VS Code and AFFiNE (4 cores) and did not lower peak RSS.
+                lint_group(scope);
             }
         }
     }
@@ -1398,6 +1408,82 @@ mod module_groups {
     use smallvec::SmallVec;
 
     use super::ModuleGroups;
+
+    #[test]
+    fn lint_callbacks_bound_pending_entry_bodies() {
+        use std::{
+            io,
+            path::Path,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        use indexmap::IndexSet;
+        use rustc_hash::{FxBuildHasher, FxHashMap};
+
+        use oxc_allocator::Allocator;
+
+        use crate::{
+            ConfigStore, ConfigStoreBuilder, ExternalPluginStore, LintOptions, Linter,
+            service::LintServiceOptions,
+        };
+
+        use super::{Runtime, RuntimeFileSystem};
+
+        #[derive(Default)]
+        struct FileSystem {
+            reads: AtomicUsize,
+            linted: AtomicUsize,
+            peak_retained: AtomicUsize,
+        }
+        impl RuntimeFileSystem for FileSystem {
+            fn read_to_arena_str<'a>(
+                &self,
+                _path: &Path,
+                allocator: &'a Allocator,
+            ) -> Result<&'a str, io::Error> {
+                let reads = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
+                let retained = reads - self.linted.load(Ordering::Relaxed);
+                self.peak_retained.fetch_max(retained, Ordering::Relaxed);
+                Ok(allocator.alloc_str("export const value = 1;"))
+            }
+
+            fn write_file(&self, _path: &Path, _content: &str) -> Result<(), io::Error> {
+                unreachable!("This test only resolves modules")
+            }
+        }
+
+        // On one worker, newly queued parses keep overtaking completed groups'
+        // lint tasks on Rayon's LIFO queue without waiting for those lints.
+        rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap().install(|| {
+            let mut external_plugins = ExternalPluginStore::default();
+            let config = ConfigStoreBuilder::default().build(&mut external_plugins).unwrap();
+            let linter = Linter::new(
+                LintOptions::default(),
+                ConfigStore::new(config, FxHashMap::default(), external_plugins),
+                None,
+            );
+            let cwd = std::env::current_dir().unwrap();
+            let runtime =
+                Runtime::new(linter, LintServiceOptions::new(cwd.clone()).with_cross_module(true));
+            let paths: IndexSet<Arc<OsStr>, FxBuildHasher> = (0..128)
+                .map(|index| Arc::from(cwd.join(format!("module-{index:03}.js")).as_os_str()))
+                .collect();
+            let file_system = FileSystem::default();
+            runtime.with_module_scope(|scope| {
+                runtime.resolve_modules(&file_system, &paths, scope, false, None, |_, _| {
+                    file_system.linted.fetch_add(1, Ordering::Relaxed);
+                });
+            });
+            assert_eq!(file_system.reads.load(Ordering::Relaxed), paths.len());
+            assert_eq!(file_system.linted.load(Ordering::Relaxed), paths.len());
+            assert!(
+                file_system.peak_retained.load(Ordering::Relaxed) < paths.len() / 2,
+                "Retained {} of {} independent entry bodies before linting completed groups",
+                file_system.peak_retained.load(Ordering::Relaxed),
+                paths.len(),
+            );
+        });
+    }
 
     fn requests(path: &str) -> (Arc<OsStr>, SmallVec<[Vec<super::ResolvedModuleRequest>; 1]>) {
         (Arc::from(OsStr::new(path)), SmallVec::new())
